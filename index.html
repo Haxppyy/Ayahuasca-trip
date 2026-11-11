@@ -1,0 +1,1247 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Ayahuasca Deep Space</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400&display=swap" rel="stylesheet">
+<style>
+  :root { --fg: #efe6d8; --dim: rgba(239,230,216,.55); --faint: rgba(239,230,216,.22); }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #000; color: var(--fg); }
+  body { font-family: 'Inter', system-ui, sans-serif; font-weight: 300; touch-action: none; }
+  canvas { display: block; position: fixed; inset: 0; width: 100%; height: 100%; }
+  body.idle { cursor: none; }
+
+  /* start layer: nothing in the centre of the view, only quiet corner notes */
+  #intro { position: fixed; inset: 0; z-index: 10; cursor: pointer; transition: opacity 2.5s ease, visibility 2.5s; }
+  #intro.gone { opacity: 0; visibility: hidden; pointer-events: none; }
+  #intro .bl { position: absolute; left: 28px; bottom: 26px; max-width: min(420px, calc(100vw - 56px)); }
+  #intro .br { position: absolute; right: 28px; bottom: 26px; display: flex; gap: 10px; }
+  #intro .l1 { font-size: 13px; letter-spacing: .22em; text-transform: uppercase; color: var(--fg); opacity: .8; }
+  #intro .l2 { font-size: 12px; color: var(--dim); margin-top: 8px; letter-spacing: .04em; }
+  #intro .l3 { font-size: 10.5px; line-height: 1.6; color: rgba(239,230,216,.32); margin-top: 14px; }
+  .btn {
+    background: rgba(0,0,0,.25); color: var(--fg); border: 1px solid var(--faint); backdrop-filter: blur(6px);
+    font: 300 11px 'Inter', sans-serif; letter-spacing: .32em; text-transform: uppercase; padding: 13px 22px 13px 26px;
+    cursor: pointer; border-radius: 999px; transition: border-color .5s, background .5s, opacity .5s;
+  }
+  .btn:hover:not(:disabled) { border-color: rgba(255,220,180,.7); background: rgba(255,220,180,.07); }
+  .btn:disabled { opacity: .35; cursor: wait; }
+  .btn[hidden] { display: none; }
+  @media (max-width: 640px) {
+    #intro .br { left: 28px; right: auto; bottom: auto; top: 26px; }
+  }
+  #keys { position: fixed; left: 28px; bottom: 24px; z-index: 6; font-size: 10.5px; letter-spacing: .06em; color: rgba(239,230,216,.35); opacity: 0; transition: opacity 2s; pointer-events: none; }
+  #keys.show { opacity: 1; }
+  kbd { font-family: inherit; border: 1px solid rgba(239,230,216,.2); border-radius: 4px; padding: 0 5px; margin: 0 1px; }
+  #toast { position: fixed; top: 22px; right: 24px; z-index: 6; font-size: 10.5px; letter-spacing: .25em; text-transform: uppercase; color: var(--dim); opacity: 0; transition: opacity .6s; pointer-events: none; }
+  #toast.show { opacity: 1; }
+  #err { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; text-align: center; padding: 24px; font-size: 14px; color: var(--dim); z-index: 20; background: #000; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="intro">
+  <div class="bl">
+    <div class="l1">Headphones on · Lights off</div>
+    <div class="l2">Click anywhere to begin. Drag to look around.</div>
+    <div class="l3">Slow light flashes, intense colour and constant motion. Not suitable for photosensitive epilepsy. Loops every five minutes.</div>
+  </div>
+  <div class="br">
+    <button class="btn" id="enter" disabled>Preparing</button>
+  </div>
+</div>
+<div id="keys"><kbd>F</kbd> fullscreen &nbsp;<kbd>M</kbd> mute &nbsp;<kbd>Space</kbd> pause &nbsp;<kbd>←</kbd><kbd>→</kbd> skip &nbsp;drag to look</div>
+<div id="toast"></div>
+<div id="err"></div>
+
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { TexturePass } from 'three/addons/postprocessing/TexturePass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+/* =====================================================================
+   SHADERS
+   Every scene is rendered on the inside of a huge sphere and builds its
+   view ray from (fragment world position - camera position), so the whole
+   journey is a true 360° world you can look around in.
+   ===================================================================== */
+
+const VERT = /* glsl */`
+varying vec3 vWorld;
+void main(){ vec4 w = modelMatrix*vec4(position, 1.0); vWorld = w.xyz; gl_Position = projectionMatrix*viewMatrix*w; }
+`;
+
+const COMMON = /* glsl */`
+precision highp float;
+varying vec3 vWorld;
+uniform float uTime;
+uniform float uWeight;
+uniform float uOnset;
+uniform float uIntensity;
+uniform float uAudio;
+uniform float uPixAng;     // radians per pixel
+uniform float uEyeScale;   // world units per unit of camera movement
+uniform float uQ;          // ray-march quality 0..1
+uniform sampler2D uNoise;
+
+#define PI  3.14159265359
+#define TAU 6.28318530718
+
+mat2 rot(float a){ float c = cos(a), s = sin(a); return mat2(c, s, -s, c); }
+float hash12(vec2 p){ vec3 p3 = fract(vec3(p.xyx)*.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y)*p3.z); }
+vec3  hash33(vec3 p3){ p3 = fract(p3*vec3(.1031,.1030,.0973)); p3 += dot(p3, p3.yxz + 33.33); return fract((p3.xxy + p3.yxx)*p3.zyx); }
+
+// texture-backed value noise (R = layer z, G = layer z+1)
+float noise(vec3 x){
+  vec3 p = floor(x); vec3 f = fract(x);
+  f = f*f*(3.0 - 2.0*f);
+  vec2 uv = (p.xy + vec2(37.0, 17.0)*p.z) + f.xy;
+  vec2 rg = textureLod(uNoise, (uv + 0.5)/256.0, 0.0).rg;
+  return mix(rg.x, rg.y, f.z);
+}
+const mat3 M3 = mat3(0.00, 0.80, 0.60, -0.80, 0.36, -0.48, -0.60, -0.48, 0.64);
+float fbm(vec3 p){ float f = 0.0, a = 0.5; for(int i = 0; i < 5; i++){ f += a*noise(p); p = M3*p*2.03; a *= 0.5; } return f; }
+float fbm3(vec3 p){ float f = 0.0, a = 0.5; for(int i = 0; i < 3; i++){ f += a*noise(p); p = M3*p*2.03; a *= 0.5; } return f; }
+
+vec3 pal(float t, vec3 a, vec3 b, vec3 c, vec3 d){ return max(a + b*cos(TAU*(c*t + d)), 0.0); }
+vec3 aya(float t){ return pal(t, vec3(.5,.45,.5), vec3(.5,.5,.5), vec3(1.), vec3(0.,.25,.55)); }
+vec3 jewel(float t){ return pal(t, vec3(.45,.35,.5), vec3(.55,.45,.5), vec3(1.,.8,.9), vec3(.85,.2,.5)); }
+vec3 starCol(float t){
+  vec3 c = mix(vec3(1.0,.55,.32), vec3(1.0,.93,.84), smoothstep(0.0, 0.55, t));
+  return mix(c, vec3(.62,.76,1.0), smoothstep(0.55, 1.0, t));
+}
+
+// view ray in a local frame where +z is "forward" (three.js looks down -z)
+vec3 headDir(){ vec3 d = normalize(vWorld - cameraPosition); return vec3(d.x, d.y, -d.z); }
+vec3 headPos(){ vec3 e = vec3(cameraPosition.x, cameraPosition.y, -cameraPosition.z)*uEyeScale; float l = length(e); return l > 0.45 ? e*(0.45/l) : e; }
+
+vec4 finish(vec3 c){ return vec4(max(c, 0.0)*uWeight, 1.0); }
+
+// faint field stars, pixel-accurate at any resolution
+vec3 stars(vec3 rd){
+  vec3 col = vec3(0.0);
+  for(int i = 0; i < 3; i++){
+    float fi = float(i);
+    float sc = 60.0 + fi*90.0;
+    vec3 id = floor(rd*sc);
+    vec3 h = hash33(id + fi*31.7);
+    float th = fi < 0.5 ? 0.9 : (fi < 1.5 ? 0.97 : 0.986);
+    if(h.x < th) continue;
+    vec3 sdir = normalize(id + 0.5 + (h.yzx - 0.5)*0.7);
+    float d = length(cross(rd, sdir))/uPixAng;
+    float mag = pow((h.x - th)/(1.0 - th), 8.0)*(1.0 - fi*0.3);
+    float tw = 0.8 + 0.2*sin(uTime*(0.6 + 3.0*h.z) + h.y*TAU);
+    col += starCol(h.z)*(exp(-d*d*0.8)*(0.025 + mag*2.5) + exp(-d*0.6)*mag*0.03)*tw;
+  }
+  return col;
+}
+
+// rare bright stars with telescope-like diffraction spikes (cube-face cells, spikes stay inside their cell)
+vec3 brightStars(vec3 rd){
+  vec3 a = abs(rd); vec2 f; float face;
+  if(a.x >= a.y && a.x >= a.z){ f = rd.yz/a.x; face = rd.x > 0.0 ? 0.0 : 1.0; }
+  else if(a.y >= a.z){ f = rd.xz/a.y; face = rd.y > 0.0 ? 2.0 : 3.0; }
+  else { f = rd.xy/a.z; face = rd.z > 0.0 ? 4.0 : 5.0; }
+  const float N = 3.0;
+  vec2 g = f*N; vec2 id = floor(g);
+  vec3 h = hash33(vec3(id, face) + 91.3);
+  if(h.x < 0.45) return vec3(0.0);
+  vec2 sp = id + 0.5 + (h.yz - 0.5)*0.3;
+  float scl = 1.0/(N*(1.0 + dot(f, f)*0.5));
+  vec2 o = (g - sp)*scl/uPixAng;
+  float L = 0.3*scl/uPixAng;
+  float r = length(o);
+  float mag = pow((h.x - 0.45)/0.55, 2.5);
+  float core = exp(-r*r*0.5)*2.5 + exp(-r*0.3)*0.25;
+  float spk = 0.0;
+  for(int k = 0; k < 3; k++){
+    float an = float(k)*PI/3.0 + PI*0.5;
+    vec2 dv = vec2(cos(an), sin(an));
+    float al = abs(dot(o, dv)), pe = abs(dot(o, vec2(-dv.y, dv.x)));
+    spk += exp(-pe*pe*0.7)*exp(-al/L*3.2);
+  }
+  spk += exp(-o.y*o.y*0.9)*exp(-abs(o.x)/L*6.0)*0.5;
+  float tw = 0.9 + 0.1*sin(uTime*1.7 + h.y*20.0);
+  return starCol(h.z)*mag*(core + spk*1.1)*tw;
+}
+
+// stereographic projection: conformal, forward = centre, behind = infinity
+vec2 stereo(vec3 d){ return d.xy/(1.0 + d.z); }
+`;
+
+/* ---------- Scene 0: deep space (Void / Onset / Return) ---------- */
+const DEEPSPACE = COMMON + /* glsl */`
+uniform float uDrift;
+uniform float uGalaxy;
+uniform float uWarm;
+
+const vec3 PDIR = vec3(-0.50, -0.22, 0.84);
+const vec3 SUND = vec3(0.92, 0.28, 0.42);
+
+vec3 milky(vec3 rd){
+  vec3 n = normalize(vec3(0.25, 1.0, 0.35));
+  float b = dot(rd, n);
+  float band = exp(-b*b*10.0);
+  if(band < 0.01) return vec3(0.0);
+  float f = fbm(rd*3.0 + 1.0);
+  float dust = smoothstep(0.45, 0.72, fbm(rd*8.0 + 5.0));
+  vec3 c = mix(vec3(.30,.27,.42), vec3(.95,.78,.62), f);
+  return c*band*(0.06 + 0.5*f*f)*(1.0 - dust*0.85)*0.45;
+}
+
+vec3 galaxy(vec3 rd){
+  vec3 gd = normalize(vec3(0.42, 0.24, 1.0));
+  if(dot(rd, gd) < 0.9) return vec3(0.0);
+  vec3 t1 = normalize(cross(vec3(0.0, 1.0, 0.0), gd));
+  vec3 t2 = cross(gd, t1);
+  vec2 q = vec2(dot(rd, t1), dot(rd, t2))/0.16;
+  q = rot(0.55)*q;
+  q.y /= 0.42;
+  float r = length(q);
+  if(r > 1.6) return vec3(0.0);
+  float a = atan(q.y, q.x);
+  float arm = pow(0.5 + 0.5*cos(a*2.0 - log(r + 0.02)*3.3 + uTime*0.008), 2.5);
+  float n  = fbm(vec3(q*5.0, 2.0));
+  float n2 = noise(vec3(q*24.0, 5.0));
+  float disk = exp(-r*3.0);
+  vec3 col = vec3(1.0,.82,.6)*exp(-r*r*55.0)*4.0;
+  col += vec3(1.0,.88,.72)*exp(-r*8.0)*0.7;
+  col += mix(vec3(.5,.62,1.0), vec3(1.0,.78,.9), n)*disk*arm*(0.4 + n)*1.6;
+  col += vec3(1.0,.32,.5)*disk*arm*smoothstep(0.66, 0.82, n2)*2.5;
+  col *= 1.0 - 0.55*smoothstep(0.5, 0.7, n)*disk*(1.0 - arm);
+  return col*smoothstep(1.6, 0.8, r)*0.9;
+}
+
+vec3 sunGlow(vec3 rd){
+  float c = max(dot(rd, normalize(SUND)), 0.0);
+  return vec3(1.0,.95,.88)*(smoothstep(0.99996, 0.99999, c)*60.0 + pow(c, 2000.0)*6.0 + pow(c, 90.0)*0.35 + pow(c, 8.0)*0.03);
+}
+
+float ringDen(float x){
+  if(x < 1.28 || x > 2.36) return 0.0;
+  float d = 0.6 + 0.4*sin(x*95.0 + noise(vec3(x*31.0, 0.5, 0.5))*4.0);
+  d *= 0.7 + 0.6*noise(vec3(x*13.0, 2.5, 0.5));
+  d *= smoothstep(1.28, 1.36, x)*smoothstep(2.36, 2.26, x);
+  d *= mix(0.3, 1.0, smoothstep(1.45, 1.6, x));
+  d *= 1.0 - 0.93*smoothstep(1.85, 1.88, x)*smoothstep(1.97, 1.94, x);   // Cassini division
+  d *= 1.0 - 0.7*smoothstep(2.165, 2.175, x)*smoothstep(2.195, 2.185, x); // Encke gap
+  return clamp(d, 0.0, 1.0);
+}
+
+// ringed gas giant lit by a distant sun
+vec4 planet(vec3 rd){
+  vec3 pd = normalize(PDIR);
+  if(dot(rd, pd) < 0.86) return vec4(0.0);
+  vec3 sun = normalize(SUND);
+  float D = 400.0, R = 400.0*0.19;
+  vec3 C = pd*D;
+  vec3 pn = normalize(vec3(0.30, 1.0, -0.18));
+  vec3 col = vec3(0.0); float alpha = 0.0;
+
+  float b = dot(-C, rd); float c = dot(C, C) - R*R; float hd = b*b - c;
+  float tP = hd > 0.0 ? -b - sqrt(hd) : 1e9;
+
+  float dn = dot(rd, pn);
+  float tR = abs(dn) > 1e-5 ? dot(C, pn)/dn : -1.0;
+  vec4 ring = vec4(0.0);
+  if(tR > 0.0){
+    vec3 P = rd*tR;
+    float x = length(P - C)/R;
+    float dens = ringDen(x);
+    if(dens > 0.0){
+      vec3 rc = mix(vec3(.60,.52,.42), vec3(.92,.84,.70), noise(vec3(x*7.0, 1.0, 0.0)));
+      vec3 so = P - C; float sb = dot(so, sun); float sh = sb*sb - (dot(so, so) - R*R);
+      float shadow = (sh > 0.0 && sb < 0.0) ? 0.03 : 1.0;
+      float lit = abs(dot(pn, sun));
+      ring = vec4(rc*(0.04 + 0.75*lit)*shadow*(0.55 + 0.45*dens), clamp(dens*0.9, 0.0, 0.93));
+    }
+  }
+  if(hd > 0.0 && tP > 0.0){
+    vec3 P = rd*tP; vec3 N = (P - C)/R;
+    vec3 e1 = normalize(cross(pn, vec3(0.0, 0.0, 1.0))); vec3 e2 = cross(pn, e1);
+    float lat = dot(N, pn);
+    float lon = atan(dot(N, e2), dot(N, e1)) + uTime*0.012;
+    float cl = sqrt(max(1.0 - lat*lat, 0.0));
+    vec3 sp = vec3(cos(lon)*cl, lat, sin(lon)*cl);
+    float warp = fbm(sp*vec3(3.5, 13.0, 3.5) + 3.0);
+    float bandc = lat*11.0 + (warp - 0.5)*1.7;
+    float fine = noise(sp*vec3(22.0, 75.0, 22.0));
+    vec3 alb = mix(vec3(.88,.80,.66), vec3(.64,.45,.30), smoothstep(-0.3, 0.6, sin(bandc*2.2)));
+    alb = mix(alb, vec3(.96,.91,.82), smoothstep(0.55, 0.95, sin(bandc*5.1 + 1.0))*0.5);
+    alb = mix(alb, vec3(.45,.36,.30), smoothstep(0.7, 1.0, sin(bandc*1.3 + 2.0))*0.35);
+    alb *= 0.86 + 0.28*fine;
+    float dl = mod(lon - 1.4 + PI, TAU) - PI;
+    vec2 st = vec2(dl*1.3, (lat + 0.33)*4.0);
+    float swirl = fbm(vec3(st*3.0, 1.0));
+    alb = mix(alb, vec3(.78,.36,.22), exp(-dot(st, st)*26.0)*(0.6 + 0.4*swirl));
+    float ndl = dot(N, sun);
+    float diff = smoothstep(-0.06, 0.35, ndl)*clamp(ndl*0.8 + 0.25, 0.0, 1.0);
+    float mu = max(dot(N, -rd), 0.0);
+    vec3 pc = alb*diff*pow(mu, 0.3)*0.85;
+    // ring shadow cast on the cloud tops
+    float ts = dot(C - P, pn)/dot(sun, pn);
+    if(ts > 0.0) pc *= 1.0 - 0.85*ringDen(length(P + sun*ts - C)/R);
+    pc += alb*0.012;                                                     // ring-shine on the night side
+    pc += vec3(.95,.78,.55)*pow(1.0 - mu, 4.0)*smoothstep(-0.25, 0.5, ndl)*0.35;
+    col = pc; alpha = 1.0;
+    if(ring.a > 0.0 && tR < tP) col = mix(col, ring.rgb, ring.a);
+  } else if(ring.a > 0.0){
+    col = ring.rgb; alpha = ring.a;
+  }
+  if(hd <= 0.0){
+    float dmin = sqrt(max(dot(C, C) - b*b, 0.0));
+    vec3 hp = normalize(rd*b - C);
+    col += vec3(.95,.8,.62)*exp(-(dmin - R)/(R*0.012))*smoothstep(-0.3, 0.6, dot(hp, sun))*0.6;
+  }
+  return vec4(col, alpha);
+}
+
+// Emission nebula: H-II gas glowing in H-alpha / OIII, blue reflection dust around hot stars,
+// opaque dust lanes with bright ionisation fronts on their edges and small dark Bok globules.
+vec4 gas(vec3 p){
+  vec3 q = p*0.085;
+  vec2 w = vec2(fbm3(q*0.9 + vec3(1.7, 9.2, 0.0)), fbm3(q*0.9 + vec3(8.3, 2.8, 4.1)));
+  q += vec3(w.x - 0.5, w.y - 0.5, w.x - w.y)*2.4;
+  q += uOnset*0.15*vec3(sin(q.y*6.0 + uTime*0.5), sin(q.z*5.0 + uTime*0.43), sin(q.x*5.5 + uTime*0.37));
+  float f = fbm(q);
+  float ridge = pow(1.0 - abs(2.0*f - 1.0), 6.0);
+  float big = smoothstep(0.32, 0.75, noise(p*0.02 + 3.0));
+  float dens = (smoothstep(0.42, 0.82, f)*1.1 + ridge*0.5*smoothstep(0.3, 0.6, f))*big;
+  float df = fbm3(q*2.3 + 4.0);
+  float dust = smoothstep(0.5, 0.68, df)*smoothstep(0.35, 0.6, f)*big;
+  float front = exp(-abs(df - 0.5)*12.0)*smoothstep(0.45, 0.7, f)*big;     // ionisation front on dust edges
+  float glob = smoothstep(0.7, 0.92, fbm3(q*3.0 + 11.0))*big*0.8;          // Bok globules
+
+  // hidden young stars lighting the gas around them
+  vec3 cid = floor(p/16.0);
+  vec3 hh = hash33(cid + 7.7);
+  float sd = length(p - (cid + 0.5 + (hh - 0.5)*0.3)*16.0);
+  float lum = step(0.72, hh.z)*(hh.z - 0.72)*3.6;
+  float halo = lum*smoothstep(5.5, 0.0, sd);
+  vec3 sCol = starCol(0.6 + 0.4*fract(hh.x*7.0));
+
+  float h = noise(p*0.045 + 10.0);
+  vec3 c = mix(vec3(.85,.10,.15), vec3(.10,.58,.70), smoothstep(0.42, 0.68, h));   // H-alpha -> OIII
+  c = mix(c, vec3(.95,.55,.25), smoothstep(0.55, 0.8, w.x)*0.45);                   // SII / warm dust
+  c = mix(c, vec3(.30,.45,1.0), halo*0.55);                                          // reflection blue near hot stars
+  c = mix(c, jewel(h*2.0 + w.x + uTime*0.04), uOnset*0.6);
+  c = mix(c, vec3(1.0,.58,.40), uWarm*0.3);
+
+  float illum = 0.3 + halo*halo*4.0;
+  vec3 em = c*dens*illum;
+  em += mix(vec3(1.0,.62,.42), sCol, 0.5)*front*(0.05 + halo*1.2);
+  em *= 1.0 - dust*0.92;
+  em *= 1.0 - glob;
+  return vec4(em, clamp(dens*0.5 + dust*0.55 + glob*0.7, 0.0, 0.96));
+}
+
+// a small cratered moon close to the gas giant
+vec4 moon(vec3 rd){
+  vec3 md = normalize(normalize(PDIR) + vec3(0.30, 0.16, 0.02));
+  if(dot(rd, md) < 0.9995) return vec4(0.0);
+  vec3 sun = normalize(SUND);
+  float D = 300.0, R = 300.0*0.0115;
+  vec3 C = md*D;
+  float b = dot(-C, rd); float h = b*b - (dot(C, C) - R*R);
+  if(h < 0.0) return vec4(0.0);
+  vec3 N = (rd*(-b - sqrt(h)) - C)/R;
+  float cr = fbm(N*6.0 + 2.0);
+  float pits = smoothstep(0.62, 0.7, noise(N*14.0))*0.35;
+  vec3 alb = vec3(.55,.53,.5)*(0.7 + 0.5*cr - pits);
+  float ndl = dot(N, sun);
+  vec3 col = alb*smoothstep(-0.02, 0.25, ndl)*max(ndl, 0.0)*1.1;
+  return vec4(col, smoothstep(0.0, R*0.08, sqrt(h)));
+}
+
+vec3 render(){
+  vec3 hd = headDir();
+  float t0 = uTime;
+  vec3 fw = normalize(vec3(sin(t0*0.013)*0.2, sin(t0*0.009)*0.1, 1.0));
+  vec3 rt = normalize(cross(vec3(sin(t0*0.011)*0.15, 1.0, 0.0), fw));
+  vec3 up = cross(fw, rt);
+  vec3 rd = normalize(rt*hd.x + up*hd.y + fw*hd.z);
+  vec3 hp = headPos();
+  vec3 ro = vec3(sin(uDrift*0.031)*4.0, cos(uDrift*0.023)*3.0, uDrift) + rt*hp.x + up*hp.y + fw*hp.z;
+
+  vec3 bg = stars(rd) + brightStars(rd) + milky(rd) + galaxy(rd)*uGalaxy + sunGlow(rd);
+  vec4 mn = moon(rd);
+  bg = bg*(1.0 - mn.a) + mn.rgb;
+  vec4 pl = planet(rd);
+  bg = bg*(1.0 - pl.a) + pl.rgb;
+
+  float clearing = 1.0 - 0.7*smoothstep(0.84, 0.96, dot(rd, normalize(PDIR)));
+  vec3 acc = vec3(0.0); float T = 1.0; float r = 3.0;
+  for(int i = 0; i < 7; i++){
+    vec4 g = gas(ro + rd*r);
+    g *= smoothstep(2.5, 6.0, r)*clearing;
+    acc += T*g.rgb; T *= 1.0 - g.a;
+    if(T < 0.03) break;
+    r *= 1.5;
+  }
+  return bg*T + acc*0.9;
+}
+void main(){ gl_FragColor = finish(render()); }
+`;
+
+/* ---------- Scene 1: hyperspace fractal temple tunnel (Breakthrough) ---------- */
+const HYPER = COMMON + /* glsl */`
+uniform float uTravel;
+
+vec3 tPath(float z){ return vec3(sin(z*0.11)*1.6 + sin(z*0.043)*2.2, cos(z*0.083)*1.3 + sin(z*0.027)*1.0, z); }
+
+float de(vec3 p, out vec4 trap){
+  vec3 c = tPath(p.z);
+  vec3 q = p - vec3(c.xy, 0.0);
+  float r = length(q.xy);
+  float carve = 1.15 - r;
+  q.xy *= rot(q.z*0.07 + uTime*0.03);
+  float a = atan(q.y, q.x);
+  float sec = TAU/7.0;
+  a = mod(a, sec) - 0.5*sec;
+  vec3 z = vec3(r*cos(a) - 2.3, r*sin(a), mod(q.z, 2.2) - 1.1);
+  float s = 1.0;
+  trap = vec4(1e5);
+  float morph = 0.15*sin(uTime*0.07);
+  for(int i = 0; i < 5; i++){
+    z = abs(z);
+    if(z.x < z.y) z.xy = z.yx;
+    if(z.x < z.z) z.xz = z.zx;
+    if(z.y < z.z) z.yz = z.zy;
+    z = z*2.2 - vec3(1.25, 1.0, 0.85 + morph)*1.2;
+    z.xy *= rot(0.18);
+    z.yz *= rot(0.09 + morph*0.3);
+    s *= 2.2;
+    trap = min(trap, vec4(abs(z), length(z)));
+  }
+  float d = (max(abs(z.x), max(abs(z.y), abs(z.z))) - 1.3)/s;
+  return max(d, carve);
+}
+vec3 calcN(vec3 p, float e){
+  vec4 tr; const vec2 k = vec2(1.0, -1.0);
+  return normalize(k.xyy*de(p + k.xyy*e, tr) + k.yyx*de(p + k.yyx*e, tr) + k.yxy*de(p + k.yxy*e, tr) + k.xxx*de(p + k.xxx*e, tr));
+}
+
+vec3 render(){
+  vec3 hd = headDir(); vec3 hp = headPos();
+  float z = uTravel;
+  vec3 ro0 = tPath(z);
+  vec3 fw = normalize(tPath(z + 2.5) - ro0);
+  float roll = (sin(uTime*0.12)*0.5 + uTravel*0.02);
+  vec3 rt = normalize(cross(vec3(sin(roll), cos(roll), 0.0), fw));
+  vec3 uu = cross(fw, rt);
+  vec3 rd = normalize(rt*hd.x + uu*hd.y + fw*hd.z);
+  vec3 ro = ro0 + (rt*hp.x + uu*hp.y + fw*hp.z)*0.6;
+
+  float t = 0.05 + 0.04*hash12(gl_FragCoord.xy + fract(uTime)*91.0);
+  vec4 trap; float d = 0.0, glow = 0.0, steps = 0.0; bool hit = false;
+  float maxS = 120.0*uQ;
+  for(int i = 0; i < 120; i++){
+    if(float(i) > maxS) break;
+    d = de(ro + rd*t, trap);
+    glow += exp(-max(d, 0.0)*25.0);
+    if(d < 0.0008*t){ hit = true; break; }
+    t += d*0.75;
+    steps += 1.0;
+    if(t > 28.0) break;
+  }
+  float hue = uTime*0.03 + z*0.01;
+  float ahead = max(dot(rd, fw), 0.0);
+  vec3 fogCol = aya(hue + 0.5)*0.02 + aya(hue)*pow(ahead, 14.0)*0.2 + vec3(1.0,.9,.8)*pow(ahead, 160.0)*0.9;
+  vec3 col = fogCol;
+  if(hit){
+    vec3 p = ro + rd*t;
+    vec3 n = calcN(p, 0.0006*t + 0.0004);
+    de(p, trap);
+    vec3 base = jewel(trap.w*0.6 + trap.x*0.3 + hue + p.z*0.015);
+    base = base*base*1.2;                                                // deep, saturated jewel tones
+    vec3 L = ro0 + fw*1.5 + uu*0.3 - p; float ld = length(L); L /= ld;
+    float att = 1.0/(1.0 + ld*ld*0.08);
+    float diff = max(dot(n, L), 0.0);
+    float spec = pow(max(dot(n, normalize(L - rd)), 0.0), 40.0);
+    float ao = clamp(1.0 - steps/90.0, 0.0, 1.0);
+    float fres = pow(1.0 - clamp(dot(n, -rd), 0.0, 1.0), 3.0);
+    float vein = exp(-min(trap.y, trap.z)*40.0);
+    col  = base*(0.02 + diff*0.55*att)*ao;
+    col += spec*att*vec3(1.0,.95,.9)*0.9;
+    col += fres*aya(hue + 0.2)*0.15*ao;
+    col += vein*aya(hue + trap.x*0.5 + 0.3)*(0.6 + 1.2*uAudio)*(0.3 + 0.7*pow(0.5 + 0.5*sin(p.z*3.0 - uTime*4.0), 3.0))*ao;
+    col = mix(col, fogCol, 1.0 - exp(-t*0.11));
+  }
+  col += glow*0.0018*aya(hue + 0.6);
+  return col;
+}
+void main(){ gl_FragColor = finish(render()); }
+`;
+
+/* ---------- Scene 2: infinite mandala dome with the watching eye (The Temple) ---------- */
+const MANDALA = COMMON + /* glsl */`
+vec3 layer(vec2 uv, float N, float speed, float seed, float px){
+  float r = length(uv) + 1e-5;
+  float a = atan(uv.y, uv.x) + uTime*0.015*speed;
+  float sec = TAU/N;
+  float ka = abs(mod(a, sec) - 0.5*sec);
+  float lr = log(r) - uTime*0.085*speed;
+  float cell = floor(lr/sec);
+  vec2 z = vec2(fract(lr/sec) - 0.5, ka/sec)*1.8;
+  float pz = px/(r*sec)*1.8;
+  float sc = 1.0, trap = 1e5;
+  vec3 col = vec3(0.0);
+  for(int i = 0; i < 6; i++){
+    float fi = float(i);
+    z = abs(z) - vec2(0.42 + 0.06*sin(uTime*0.11 + seed), 0.28 + 0.05*cos(uTime*0.09 + fi));
+    z *= rot(0.62 + 0.12*sin(uTime*0.05 + seed + fi*0.7));
+    z *= 1.32; sc *= 1.32;
+    float dc = abs(length(z) - 0.35)/sc;
+    float dl = abs(z.y)/sc;
+    float w = pz*0.9 + 0.001;
+    float line = smoothstep(w*1.6, 0.0, dc) + 0.5*smoothstep(w*1.2, 0.0, dl);
+    line += 0.03*exp(-dc/(w*4.0));
+    vec3 lc = jewel(fi*0.11 + cell*0.13 + uTime*0.03 + seed);
+    col += lc*lc*line*(1.0 - fi*0.1)*0.32;
+    trap = min(trap, dot(z, z));
+  }
+  vec3 fc = aya(sqrt(trap)*1.6 + cell*0.21 + uTime*0.02 + seed);
+  vec3 fill = fc*fc*0.07*smoothstep(1.2, 0.0, trap);
+  return (col + fill)*smoothstep(0.04, 0.012, pz);  // fade detail that gets finer than a pixel
+}
+
+vec3 iris(vec2 uv, float R){
+  float r = length(uv)/R;
+  if(r > 1.6) return vec3(0.0);
+  float a = atan(uv.y, uv.x);
+  vec2 d2 = vec2(cos(a), sin(a));
+  float fib  = fbm(vec3(d2*14.0, r*2.5 - uTime*0.05));
+  float fib2 = noise(vec3(d2*42.0, r*6.0));
+  float pr = 0.34 + 0.05*sin(uTime*0.5) - 0.05*uAudio;
+  vec3 col = mix(vec3(.04,.30,.32), vec3(.95,.66,.22), smoothstep(0.3, 0.75, fib));
+  col = mix(col, vec3(.55,.08,.45), smoothstep(0.6, 0.0, r - pr)*0.55);
+  col *= 0.55 + 0.9*fib2;
+  col += vec3(.95,.7,.3)*exp(-abs(r - pr*1.7)*22.0)*0.5;
+  col *= smoothstep(1.02, 0.86, r);
+  col *= smoothstep(pr, pr + 0.035, r);
+  col += aya(uTime*0.05)*exp(-r*7.0)*0.25*smoothstep(pr + 0.02, pr - 0.05, r);
+  vec2 hp = uv/R - vec2(-0.32, 0.36);
+  col += vec3(1.0)*exp(-dot(hp, hp)*110.0)*1.6;
+  col += jewel(uTime*0.03)*exp(-abs(r - 1.06)*16.0)*0.9;
+  return col*1.3;
+}
+
+vec3 render(){
+  vec3 d = headDir();
+  vec3 wd = d;
+  d.xz *= rot(sin(uTime*0.03)*0.12);
+  d.yz *= rot(cos(uTime*0.025)*0.08);
+  const float K = 1.8;
+  vec2 uv = stereo(d)*K;
+  float px = uPixAng*K/max(1.0 + d.z, 0.05);
+  uv = rot(sin(uTime*0.05)*0.25)*uv*(1.0 + 0.04*sin(uTime*0.3) + 0.012*uAudio);
+  float r = length(uv);
+  vec3 col = layer(uv, 8.0, 1.0, 0.0, px);
+  col += 0.55*layer(rot(0.3)*uv*0.72, 6.0, -0.7, 2.3, px*0.72);
+  col *= 1.0 + 0.35*sin(log(r + 1e-4)*6.0 - uTime*1.2);
+  col *= smoothstep(-0.97, -0.6, d.z);
+  col += stars(wd)*0.5;
+  float R = 0.13*(1.0 + 0.06*sin(uTime*0.4) + 0.05*uAudio);
+  col *= smoothstep(R*1.0, R*1.7, r);
+  col += iris(uv, R);
+  return col;
+}
+void main(){ gl_FragColor = finish(render()); }
+`;
+
+/* ---------- Scene 3: cosmic serpents (The Serpent) ---------- */
+const SERPENT = COMMON + /* glsl */`
+uniform float uSTravel;
+const float SR = 1.7;
+const float SP = 8.0;
+
+vec2 sCurve(float z){ return vec2(sin(z*0.06)*2.5, cos(z*0.045)*1.8); }
+
+float de(vec3 p, out vec4 info){
+  p.xy -= sCurve(p.z);
+  float rr = length(p.xy);
+  float ang = atan(p.y, p.x);
+  float best = 1e5;
+  info = vec4(0.0);
+  float kf = SR/sqrt(SR*SR + (SP/TAU)*(SP/TAU));
+  for(int k = 0; k < 2; k++){
+    float ph = ang + float(k)*PI + uTime*0.35;
+    float zz = p.z - ph/TAU*SP;
+    float zm = zz - floor(zz/SP + 0.5)*SP;
+    float along = p.z - zm;
+    float rad = 0.6 + 0.06*sin(along*1.3 - uTime*2.0);
+    vec2 q = vec2(rr - SR, zm*kf);
+    float d = length(q) - rad;
+    if(d < best){ best = d; info = vec4(along, atan(q.y, q.x), float(k), rad); }
+  }
+  return best;
+}
+vec3 calcN(vec3 p){
+  vec4 tr; const vec2 k = vec2(1.0, -1.0); float e = 0.002;
+  return normalize(k.xyy*de(p + k.xyy*e, tr) + k.yyx*de(p + k.yyx*e, tr) + k.yxy*de(p + k.yxy*e, tr) + k.xxx*de(p + k.xxx*e, tr));
+}
+
+vec3 skin(vec4 info, vec3 n, vec3 rd, out float glow){
+  float arc = info.x*1.67;
+  float v = info.y;
+  vec2 st = vec2(arc*5.6, v/TAU*22.0);
+  st.x += mod(floor(st.y), 2.0)*0.5;
+  vec2 f = fract(st) - 0.5;
+  float sd = length(f*vec2(1.0, 1.25));
+  float dome = smoothstep(0.62, 0.05, sd);
+  float edge = smoothstep(0.36, 0.52, sd);
+  float spots = smoothstep(0.56, 0.66, noise(vec3(arc*0.9, cos(v)*1.4, sin(v)*1.4 + info.z*7.0)));
+  vec3 col = mix(vec3(.10,.20,.05), vec3(.58,.52,.16), 0.5 + 0.5*sin(v + 0.6));
+  col = mix(col, vec3(.015,.015,.01), spots*0.88);
+  float ndv = clamp(dot(n, -rd), 0.0, 1.0);
+  col = mix(col, col*aya(ndv*1.5 + arc*0.05 + uTime*0.05 + info.z*0.5)*2.6, 0.55);
+  col *= (0.45 + 0.75*dome)*(1.0 - edge*0.65);
+  vec2 kg = vec2(arc*1.1, v/TAU*8.0);
+  vec2 kc = fract(kg) - 0.5;
+  if(hash12(floor(kg) + info.z*13.0) > 0.5) kc.x = -kc.x;
+  float dk = abs(kc.x - kc.y)*0.7071;
+  float kline = smoothstep(0.07, 0.015, dk);
+  glow = kline*(0.25 + 0.75*pow(0.5 + 0.5*sin(arc*0.7 - uTime*2.4 + info.z*PI), 3.0))*(0.35 + uIntensity);
+  return col;
+}
+
+vec3 render(){
+  vec3 hd = headDir(); vec3 hp = headPos();
+  float z = uSTravel;
+  vec3 ro0 = vec3(sCurve(z), z);
+  vec3 fw = normalize(vec3(sCurve(z + 3.0), z + 3.0) - ro0);
+  float roll = uTime*0.1;
+  vec3 rt = normalize(cross(vec3(sin(roll), cos(roll), 0.0), fw));
+  vec3 uu = cross(fw, rt);
+  vec3 rd = normalize(rt*hd.x + uu*hd.y + fw*hd.z);
+  vec3 ro = ro0 + (rt*hp.x + uu*hp.y + fw*hp.z)*0.6;
+
+  float t = 0.1; vec4 info; bool hit = false; float steps = 0.0;
+  float maxS = 100.0*uQ;
+  for(int i = 0; i < 100; i++){
+    if(float(i) > maxS) break;
+    float d = de(ro + rd*t, info);
+    if(d < 0.001*t){ hit = true; break; }
+    t += d*0.7;
+    steps += 1.0;
+    if(t > 45.0) break;
+  }
+  vec3 bg = stars(rd)*0.8 + brightStars(rd)*0.6;
+  float g = fbm(rd*2.5 + vec3(0.0, 0.0, uTime*0.02));
+  bg += mix(vec3(.03,.16,.12), vec3(.38,.07,.32), smoothstep(0.35, 0.65, fbm3(rd*1.3 + 9.0)))*g*g*0.7;
+  float ahead = max(dot(rd, fw), 0.0);
+  bg += vec3(1.0,.8,.5)*pow(ahead, 40.0)*1.8 + aya(uTime*0.02)*pow(ahead, 6.0)*0.25;
+  vec3 col = bg;
+  if(hit){
+    vec3 p = ro + rd*t;
+    vec3 n = calcN(p);
+    de(p, info);
+    float kglow;
+    vec3 alb = skin(info, n, rd, kglow);
+    vec3 L = normalize(vec3(sCurve(z + 20.0), z + 20.0) - p);
+    float dif = max(dot(n, L), 0.0);
+    float sp = pow(max(dot(reflect(rd, n), L), 0.0), 48.0);
+    float rim = pow(1.0 - max(dot(n, -rd), 0.0), 3.0);
+    float ao = clamp(1.0 - steps/80.0, 0.2, 1.0);
+    col = alb*(0.07 + 1.4*dif)*ao + sp*vec3(1.0,.9,.7)*0.9 + rim*vec3(.2,.6,.75)*0.5;
+    col += kglow*mix(vec3(.1,.9,1.0), vec3(1.0,.2,.8), info.z)*(2.2 + 1.5*uAudio);
+    col = mix(col, bg, 1.0 - exp(-t*0.035));
+  }
+  return col;
+}
+void main(){ gl_FragColor = finish(render()); }
+`;
+
+/* ---------- Overlay: flower-of-life geometry settling over the world ---------- */
+const OVERLAY = COMMON + /* glsl */`
+vec3 render(){
+  vec3 d = headDir();
+  d.xy *= rot(uTime*0.02);
+  const float K = 2.8;
+  vec2 uv = stereo(d)*K;
+  float t = uTime;
+  vec2 w = uv + 0.09*(vec2(noise(vec3(uv*1.4, t*0.1)), noise(vec3(uv*1.4 + 7.0, t*0.1))) - 0.5);
+  float sc = 2.6 + 0.3*sin(t*0.07);
+  vec2 p = w*sc;
+  vec2 s = vec2(1.0, 1.7320508);
+  vec2 a = mod(p, s) - 0.5*s;
+  vec2 b = mod(p - 0.5*s, s) - 0.5*s;
+  vec2 g = dot(a, a) < dot(b, b) ? a : b;
+  float dd = abs(length(g) - 1.0);
+  for(int i = 0; i < 6; i++){
+    float an = float(i)*PI/3.0;
+    dd = min(dd, abs(length(g - vec2(cos(an), sin(an))) - 1.0));
+  }
+  float px = uPixAng*K/max(1.0 + d.z, 0.05)*sc;
+  float line = smoothstep(px*1.2, 0.0, dd)*0.8 + exp(-dd*30.0)*0.12;
+  float r = length(uv);
+  // the geometry only surfaces in drifting patches and breathes in and out, never as a flat stamp
+  float patchMask = smoothstep(0.42, 0.72, fbm3(vec3(uv*0.9, t*0.05)));
+  float breathe = 0.55 + 0.45*sin(t*0.42 + r*1.5);
+  float wave = 0.5 + 0.5*sin(r*5.0 - t*1.1);
+  float shimmer = 0.75 + 0.25*noise(vec3(uv*14.0, t*1.5));
+  vec3 col = jewel(r*0.3 - t*0.05 + atan(uv.y, uv.x)/TAU + dd)*line*(0.15 + 0.85*wave*wave);
+  return col*0.26*patchMask*breathe*shimmer*smoothstep(0.05, 0.5, r)*smoothstep(-0.9, -0.3, d.z)*(1.0 + 0.4*uAudio);
+}
+void main(){ gl_FragColor = finish(render()); }
+`;
+
+/* ---------- Feedback (tracers / afterimages) ---------- */
+const QUAD_VERT = `varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`;
+const FEEDBACK = /* glsl */`
+precision highp float;
+varying vec2 vUv;
+uniform sampler2D uCur;
+uniform sampler2D uPrev;
+uniform float uTrail;
+uniform float uFlow;
+uniform float uTime;
+vec3 hueShift(vec3 c, float a){ const vec3 k = vec3(0.57735); float ca = cos(a); return c*ca + cross(k, c)*sin(a) + k*dot(k, c)*(1.0 - ca); }
+void main(){
+  vec3 cur = texture2D(uCur, vUv).rgb;
+  vec2 c = vUv - 0.5;
+  float ang = 0.0015*sin(uTime*0.11)*uFlow;
+  vec2 pc = mat2(cos(ang), sin(ang), -sin(ang), cos(ang))*c*(1.0 - 0.0012*uFlow);
+  vec3 prev = hueShift(max(texture2D(uPrev, pc + 0.5).rgb, 0.0), 0.02*uFlow);
+  gl_FragColor = vec4(max(cur, prev*uTrail), 1.0);
+}
+`;
+
+/* ---------- Final lens / body pass (desktop) ---------- */
+const FINAL = {
+  uniforms: {
+    tDiffuse: { value: null }, uTime: { value: 0 }, uIntensity: { value: 0 }, uFlash: { value: 0 },
+    uZoom: { value: 0 }, uRes: { value: new THREE.Vector2(1, 1) },
+  },
+  vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix*modelViewMatrix*vec4(position, 1.0); }`,
+  fragmentShader: /* glsl */`
+  precision highp float;
+  uniform sampler2D tDiffuse; uniform float uTime, uIntensity, uFlash, uZoom; uniform vec2 uRes;
+  varying vec2 vUv;
+  float h12(vec2 p){ vec3 p3 = fract(vec3(p.xyx)*.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y)*p3.z); }
+  vec3 sampleCA(vec2 uv, vec2 off){ return vec3(texture2D(tDiffuse, uv - off).r, texture2D(tDiffuse, uv).g, texture2D(tDiffuse, uv + off).b); }
+  void main(){
+    vec2 uv = vUv;
+    float m = uIntensity;
+    // breathing, melting visual field
+    uv += m*0.0032*vec2(sin(uv.y*9.0 + uTime*0.9) + 0.4*sin(uv.y*23.0 - uTime*1.3),
+                        cos(uv.x*8.0 + uTime*0.7) + 0.4*cos(uv.x*19.0 + uTime*1.1));
+    float asp = uRes.x/uRes.y;
+    vec2 cc = uv - 0.5;
+    float r2 = dot(cc*vec2(asp, 1.0), cc*vec2(asp, 1.0));
+    uv = 0.5 + cc*(1.0 - 0.03*r2);
+    vec2 off = cc*(0.003 + 0.01*m)*(0.4 + r2*1.6);
+    vec3 col;
+    if(uZoom > 0.01){
+      col = vec3(0.0); float tot = 0.0;
+      for(int i = 0; i < 14; i++){
+        float f = float(i)/13.0;
+        float w = 1.0 - f*0.65;
+        col += sampleCA(0.5 + (uv - 0.5)*(1.0 - uZoom*0.2*f), off*(1.0 + f*2.5))*w;
+        tot += w;
+      }
+      col /= tot;
+    } else col = sampleCA(uv, off);
+    col += vec3(1.0, .96, .92)*uFlash*3.0;
+    float vig = smoothstep(1.25, 0.2, length(cc*vec2(asp*0.75, 1.0))*1.15);
+    col *= mix(0.2, 1.0, vig);
+    float g = h12(gl_FragCoord.xy + fract(uTime*13.37)*1000.0) - 0.5;
+    col += g*0.035*(0.2 + sqrt(max(col, 0.0)));
+    gl_FragColor = vec4(max(col, 0.0), 1.0);
+  }`
+};
+
+/* =====================================================================
+   TIMELINE  (five-minute loop)
+   ===================================================================== */
+const PHASES = [
+  { name: 'void',         dur: 40, scene: 0, i: [0.05, 0.15], o: [0.0, 0.04],  g: [1, 1],   warm: [0, 0], rat: [0.0, 0.05], wh: 0 },
+  { name: 'onset',        dur: 45, scene: 0, i: [0.15, 0.65], o: [0.04, 0.85], g: [1, 0.3], warm: [0, 0], rat: [0.1, 0.6],  wh: 0 },
+  { name: 'breakthrough', dur: 60, scene: 1, i: [1.0, 0.95],  o: [0.22, 0.18], g: [0, 0],   warm: [0, 0], rat: [0.15, 0.3], wh: 0 },
+  { name: 'temple',       dur: 55, scene: 2, i: [0.95, 0.85], o: [0.08, 0.12], g: [0, 0],   warm: [0, 0], rat: [0.5, 0.5],  wh: 1 },
+  { name: 'serpent',      dur: 55, scene: 3, i: [0.85, 0.6],  o: [0.15, 0.25], g: [0, 0],   warm: [0, 0], rat: [0.45, 0.35], wh: 1 },
+  { name: 'return',       dur: 45, scene: 0, i: [0.5, 0.05],  o: [0.4, 0.0],   g: [0.6, 1], warm: [1, 0], rat: [0.25, 0.0], wh: 0.6 },
+];
+const STARTS = []; { let a = 0; for (const p of PHASES) { STARTS.push(a); a += p.dur; } }
+const TOTAL = PHASES.reduce((s, p) => s + p.dur, 0);
+const T_BREAK = STARTS[2];
+const FADE = 6;
+const smooth = (a, b, x) => { const t = Math.min(Math.max((x - a) / (b - a), 0), 1); return t * t * (3 - 2 * t); };
+const lerp = (a, b, x) => a + (b - a) * x;
+
+function phaseState(time) {
+  const t = ((time % TOTAL) + TOTAL) % TOTAL;
+  let i = PHASES.length - 1;
+  for (let k = 0; k < PHASES.length; k++) if (t < STARTS[k] + PHASES[k].dur) { i = k; break; }
+  const ph = PHASES[i], next = PHASES[(i + 1) % PHASES.length];
+  const lt = t - STARTS[i], u = lt / ph.dur, su = smooth(0, 1, u);
+  const f = smooth(ph.dur - FADE, ph.dur, lt);
+  const w = [0, 0, 0, 0]; w[ph.scene] += 1 - f; w[next.scene] += f;
+  const v = (key) => lerp(lerp(ph[key][0], ph[key][1], su), next[key][0], f);
+  const dB = t - T_BREAK;
+  const zoom = dB < 0 ? smooth(-9, 0, dB) : 1 - smooth(0, 3.5, dB);
+  const flash = dB < 0 ? Math.exp(dB * 5) : Math.exp(-dB * 1.6);
+  return {
+    t, i, lt, u, w, intensity: v('i'), onset: v('o'), galaxy: v('g'), warm: v('warm'), rattle: v('rat'),
+    whistle: lerp(ph.wh, next.wh, f), zoom: zoom * (dB > -9 && dB < 3.5 ? 1 : 0),
+    flash: (dB > -1.5 && dB < 5) ? flash : 0, sinceBreak: dB,
+  };
+}
+
+/* =====================================================================
+   AUDIO: generative ceremony soundscape
+   ===================================================================== */
+class Ceremony {
+  constructor() { this.ctx = null; this.muted = false; this.level = 0; this.vol = 0.85; this.intensity = 0; }
+  start() {
+    const ctx = this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const now = ctx.currentTime;
+    this.master = ctx.createGain(); this.master.gain.value = 0;
+    const comp = ctx.createDynamicsCompressor(); comp.threshold.value = -16; comp.ratio.value = 3.5; comp.knee.value = 12;
+    this.analyser = ctx.createAnalyser(); this.analyser.fftSize = 512; this.abuf = new Uint8Array(512);
+    this.master.connect(comp); comp.connect(this.analyser); this.analyser.connect(ctx.destination);
+    this.master.gain.setTargetAtTime(this.vol, now, 2.5);
+
+    this.rev = ctx.createConvolver(); this.rev.buffer = this.impulse(7.5, 2.4);
+    const revOut = ctx.createGain(); revOut.gain.value = 0.85; this.rev.connect(revOut); revOut.connect(this.master);
+    this.noiseBuf = this.noise(2.5, false);
+
+    // drone
+    this.droneF = ctx.createBiquadFilter(); this.droneF.type = 'lowpass'; this.droneF.frequency.value = 250; this.droneF.Q.value = 2.5;
+    const dG = ctx.createGain(); dG.gain.value = 0.17;
+    this.droneF.connect(dG); dG.connect(this.master); this.send(dG, 0.35);
+    [[55, 'sawtooth', 0, 0.22], [55, 'sawtooth', 8, 0.22], [82.41, 'triangle', -5, 0.3], [110, 'sawtooth', -7, 0.12], [27.5, 'sine', 0, 1.0], [164.81, 'triangle', 4, 0.08]]
+      .forEach(([f, type, det, g]) => { const o = ctx.createOscillator(); o.type = type; o.frequency.value = f; o.detune.value = det; const gg = ctx.createGain(); gg.gain.value = g; o.connect(gg); gg.connect(this.droneF); o.start(); });
+    const lfo = ctx.createOscillator(); lfo.frequency.value = 0.045; const lg = ctx.createGain(); lg.gain.value = 140; lfo.connect(lg); lg.connect(this.droneF.frequency); lfo.start();
+
+    // binaural theta (6 Hz)
+    const merger = ctx.createChannelMerger(2); const bG = ctx.createGain(); bG.gain.value = 0.05;
+    [[110, 0], [116, 1]].forEach(([f, ch]) => { const o = ctx.createOscillator(); o.frequency.value = f; o.connect(merger, 0, ch); o.start(); });
+    merger.connect(bG); bG.connect(this.master);
+
+    // shimmering pad
+    this.padG = ctx.createGain(); this.padG.gain.value = 0; this.padG.connect(this.rev);
+    const padDry = ctx.createGain(); padDry.gain.value = 0.25; this.padG.connect(padDry); padDry.connect(this.master);
+    [220, 329.63, 440, 523.25, 659.25, 783.99, 987.77, 1318.5].forEach((f, k) => {
+      const o = ctx.createOscillator(); o.frequency.value = f; o.detune.value = (Math.random() - 0.5) * 8;
+      const g = ctx.createGain(); g.gain.value = 0.5;
+      const l = ctx.createOscillator(); l.frequency.value = 0.03 + Math.random() * 0.09; const la = ctx.createGain(); la.gain.value = 0.5;
+      l.connect(la); la.connect(g.gain); l.start(now + Math.random() * 3);
+      const amp = ctx.createGain(); amp.gain.value = 0.05 / (1 + k * 0.25);
+      o.connect(g); g.connect(amp); amp.connect(this.padG); o.start();
+    });
+
+    // cosmic wind
+    const wsrc = ctx.createBufferSource(); wsrc.buffer = this.noise(6, true); wsrc.loop = true;
+    this.windF = ctx.createBiquadFilter(); this.windF.type = 'bandpass'; this.windF.frequency.value = 400; this.windF.Q.value = 0.8;
+    const wl = ctx.createOscillator(); wl.frequency.value = 0.06; const wla = ctx.createGain(); wla.gain.value = 250; wl.connect(wla); wla.connect(this.windF.frequency); wl.start();
+    this.windG = ctx.createGain(); this.windG.gain.value = 0.0;
+    wsrc.connect(this.windF); this.windF.connect(this.windG); this.windG.connect(this.master); this.send(this.windG, 0.5); wsrc.start();
+
+    // buses
+    this.ratG = ctx.createGain(); this.ratG.gain.value = 0; this.ratG.connect(this.master); this.send(this.ratG, 0.45);
+    this.whG = ctx.createGain(); this.whG.gain.value = 0; this.whG.connect(this.rev);
+    const whDry = ctx.createGain(); whDry.gain.value = 0.35; this.whG.connect(whDry); whDry.connect(this.master);
+
+    this.nextShake = now + 0.5; this.shakeN = 0; this.nextPhrase = now + 3; this.whistleOn = 0;
+    this.timer = setInterval(() => this.schedule(), 40);
+  }
+  send(node, amt) { const g = this.ctx.createGain(); g.gain.value = amt; node.connect(g); g.connect(this.rev); }
+  noise(sec, brown) {
+    const ctx = this.ctx, len = Math.floor(sec * ctx.sampleRate), b = ctx.createBuffer(1, len, ctx.sampleRate), d = b.getChannelData(0);
+    let last = 0;
+    for (let i = 0; i < len; i++) { const w = Math.random() * 2 - 1; if (brown) { last = (last + 0.02 * w) / 1.02; d[i] = last * 3.5; } else d[i] = w; }
+    return b;
+  }
+  impulse(sec, decay) {
+    const ctx = this.ctx, len = Math.floor(sec * ctx.sampleRate), b = ctx.createBuffer(2, len, ctx.sampleRate);
+    for (let c = 0; c < 2; c++) { const d = b.getChannelData(c); for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, decay); }
+    return b;
+  }
+  shake(time, vel) {   // chakapa leaf-bundle rattle
+    const ctx = this.ctx;
+    for (let k = 0; k < 2; k++) {
+      const s = ctx.createBufferSource(); s.buffer = this.noiseBuf; s.playbackRate.value = 0.9 + Math.random() * 0.3;
+      const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 2600 + Math.random() * 1800; bp.Q.value = 1.1;
+      const hp = ctx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 1100;
+      const g = ctx.createGain(); const t0 = time + k * 0.028, v = vel * (k ? 0.45 : 1);
+      g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(v, t0 + 0.014); g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.2 + Math.random() * 0.06);
+      s.connect(bp); bp.connect(hp); hp.connect(g); g.connect(this.ratG);
+      s.start(t0, Math.random() * 2); s.stop(t0 + 0.3);
+    }
+  }
+  phrase(time) {   // whistled, icaro-like melody
+    const ctx = this.ctx, scale = [440, 523.25, 587.33, 659.25, 783.99, 880, 1046.5];
+    const o = ctx.createOscillator(); o.type = 'sine';
+    const vib = ctx.createOscillator(); vib.frequency.value = 5.2; const va = ctx.createGain(); va.gain.value = 6; vib.connect(va); va.connect(o.frequency);
+    const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 2400;
+    const g = ctx.createGain(); g.gain.value = 0;
+    o.connect(lp); lp.connect(g); g.connect(this.whG);
+    let t = time, idx = 2 + Math.floor(Math.random() * 3);
+    const n = 4 + Math.floor(Math.random() * 4);
+    o.frequency.setValueAtTime(scale[idx], t);
+    for (let k = 0; k < n; k++) {
+      idx = Math.min(scale.length - 1, Math.max(0, idx + [-2, -1, -1, 1, 1, 2][Math.floor(Math.random() * 6)]));
+      if (k === n - 1) idx = Math.max(0, idx - 1);
+      const d = 0.35 + Math.random() * 0.6;
+      o.frequency.setTargetAtTime(scale[idx], t, 0.05);
+      g.gain.setTargetAtTime(0.09, t, 0.04); g.gain.setTargetAtTime(0.05, t + d * 0.7, 0.08);
+      t += d;
+    }
+    g.gain.setTargetAtTime(0, t, 0.25);
+    o.start(time); vib.start(time); o.stop(t + 2); vib.stop(t + 2);
+    return t - time;
+  }
+  bowl(time, f = 196) {   // singing bowl marking each new stage
+    const ctx = this.ctx;
+    [[1, 0.06], [2.76, 0.03], [5.4, 0.012], [8.9, 0.005]].forEach(([m, a]) => {
+      const o = ctx.createOscillator(); o.frequency.value = f * m; const g = ctx.createGain();
+      g.gain.setValueAtTime(0.0001, time); g.gain.exponentialRampToValueAtTime(a, time + 0.02); g.gain.exponentialRampToValueAtTime(0.0001, time + 9);
+      const tr = ctx.createOscillator(); tr.frequency.value = 3 + m * 0.3; const ta = ctx.createGain(); ta.gain.value = a * 0.3; tr.connect(ta); ta.connect(g.gain);
+      o.connect(g); g.connect(this.master); this.send(g, 0.8); o.start(time); tr.start(time); o.stop(time + 9.5); tr.stop(time + 9.5);
+    });
+  }
+  whoosh(time, dur) {   // the rising rush into the breakthrough
+    const ctx = this.ctx;
+    const s = ctx.createBufferSource(); s.buffer = this.noise(dur + 1, false);
+    const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = 1.5;
+    bp.frequency.setValueAtTime(120, time); bp.frequency.exponentialRampToValueAtTime(6000, time + dur);
+    const g = ctx.createGain(); g.gain.setValueAtTime(0.0001, time); g.gain.exponentialRampToValueAtTime(0.4, time + dur); g.gain.exponentialRampToValueAtTime(0.0001, time + dur + 0.6);
+    s.connect(bp); bp.connect(g); g.connect(this.master); this.send(g, 0.6); s.start(time); s.stop(time + dur + 1);
+    const o = ctx.createOscillator(); o.type = 'sawtooth'; o.frequency.setValueAtTime(55, time); o.frequency.exponentialRampToValueAtTime(880, time + dur);
+    const of = ctx.createBiquadFilter(); of.type = 'lowpass'; of.frequency.value = 1800;
+    const og = ctx.createGain(); og.gain.setValueAtTime(0.0001, time); og.gain.exponentialRampToValueAtTime(0.08, time + dur); og.gain.exponentialRampToValueAtTime(0.0001, time + dur + 0.3);
+    o.connect(of); of.connect(og); og.connect(this.master); this.send(og, 0.5); o.start(time); o.stop(time + dur + 0.5);
+    const b = ctx.createOscillator(); b.frequency.setValueAtTime(70, time + dur); b.frequency.exponentialRampToValueAtTime(26, time + dur + 3.5);
+    const bg = ctx.createGain(); bg.gain.setValueAtTime(0.0001, time + dur); bg.gain.exponentialRampToValueAtTime(0.7, time + dur + 0.03); bg.gain.exponentialRampToValueAtTime(0.0001, time + dur + 4.5);
+    b.connect(bg); bg.connect(this.master); this.send(bg, 0.4); b.start(time + dur); b.stop(time + dur + 5);
+    this.bowl(time + dur, 146.83); this.bowl(time + dur + 0.01, 220);
+  }
+  schedule() {
+    if (!this.ctx || this.ctx.state !== 'running') return;
+    const now = this.ctx.currentTime;
+    while (this.nextShake < now + 0.15) {
+      const accent = this.shakeN % 2 === 0;
+      this.shake(this.nextShake, accent ? 0.9 : 0.55);
+      this.nextShake += (this.shakeN % 2 ? 0.34 : 0.38) + (Math.random() - 0.5) * 0.02;
+      this.shakeN++;
+    }
+    if (this.whistleOn > 0.3 && now > this.nextPhrase) {
+      const len = this.phrase(now + 0.05);
+      this.nextPhrase = now + len + 3 + Math.random() * 6;
+    }
+  }
+  update(s) {
+    if (!this.ctx) return;
+    const now = this.ctx.currentTime, tc = 1.2;
+    this.intensity = s.intensity;
+    this.droneF.frequency.setTargetAtTime(170 + 1500 * s.intensity, now, tc);
+    this.padG.gain.setTargetAtTime(0.05 + 0.9 * s.intensity, now, tc);
+    this.windG.gain.setTargetAtTime(0.04 + 0.12 * s.w[1] + 0.05 * s.w[0], now, tc);
+    this.windF.frequency.setTargetAtTime(300 + 900 * s.w[1], now, tc);
+    this.ratG.gain.setTargetAtTime(s.rattle * 0.55, now, tc);
+    this.whG.gain.setTargetAtTime(s.whistle, now, tc);
+    this.whistleOn = s.whistle;
+    this.analyser.getByteTimeDomainData(this.abuf);
+    let sum = 0; for (let i = 0; i < this.abuf.length; i++) { const v = (this.abuf[i] - 128) / 128; sum += v * v; }
+    this.level = this.level * 0.85 + Math.sqrt(sum / this.abuf.length) * 0.15;
+  }
+  setMuted(m) { this.muted = m; if (this.ctx) this.master.gain.setTargetAtTime(m ? 0 : this.vol, this.ctx.currentTime, 0.3); }
+  pause(p) { if (this.ctx) (p ? this.ctx.suspend() : this.ctx.resume()); }
+}
+
+/* =====================================================================
+   RENDERER
+   ===================================================================== */
+const params = new URLSearchParams(location.search);
+let renderer;
+try {
+  renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
+  if (!renderer.capabilities.isWebGL2) throw new Error('webgl2');
+} catch (e) {
+  const el = document.getElementById('err'); el.style.display = 'flex'; el.textContent = 'This experience needs a browser with WebGL 2.'; throw e;
+}
+const PR = Math.min(window.devicePixelRatio || 1, 1.0);
+renderer.setPixelRatio(PR);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+document.body.prepend(renderer.domElement);
+renderer.domElement.addEventListener('webglcontextlost', (e) => { e.preventDefault(); });
+renderer.domElement.addEventListener('webglcontextrestored', () => location.reload());
+
+function makeNoiseTexture() {
+  const N = 256, data = new Uint8Array(N * N * 4), R = new Uint8Array(N * N);
+  let seed = 1337; const rnd = () => ((seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296);
+  for (let i = 0; i < N * N; i++) R[i] = Math.floor(rnd() * 256);
+  for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+    const i = (y * N + x) * 4;
+    data[i] = R[y * N + x];
+    data[i + 1] = R[((y + 17) & 255) * N + ((x + 37) & 255)];
+    data[i + 2] = Math.floor(rnd() * 256); data[i + 3] = 255;
+  }
+  const tex = new THREE.DataTexture(data, N, N, THREE.RGBAFormat);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.magFilter = tex.minFilter = THREE.LinearFilter; tex.generateMipmaps = false; tex.needsUpdate = true;
+  return tex;
+}
+
+const shared = {
+  uTime: { value: 0 }, uOnset: { value: 0 }, uIntensity: { value: 0 }, uAudio: { value: 0 },
+  uPixAng: { value: 0.002 }, uEyeScale: { value: 0.6 }, uQ: { value: 1 },
+  uNoise: { value: makeNoiseTexture() },
+  uDrift: { value: 0 }, uGalaxy: { value: 1 }, uWarm: { value: 0 }, uTravel: { value: 0 }, uSTravel: { value: 100 },
+};
+
+const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.05, 1000);
+camera.rotation.order = 'YXZ';
+const world = new THREE.Scene();
+world.add(camera);
+const sphereGeo = new THREE.SphereGeometry(100, 64, 32);
+function layerMesh(frag, order) {
+  const mat = new THREE.ShaderMaterial({
+    vertexShader: VERT, fragmentShader: frag, uniforms: { ...shared, uWeight: { value: 0 } },
+    side: THREE.BackSide, blending: THREE.AdditiveBlending, transparent: true, depthTest: false, depthWrite: false,
+  });
+  const m = new THREE.Mesh(sphereGeo, mat);
+  m.frustumCulled = false; m.renderOrder = order;
+  world.add(m);
+  return m;
+}
+const layers = [layerMesh(DEEPSPACE, 0), layerMesh(HYPER, 1), layerMesh(MANDALA, 2), layerMesh(SERPENT, 3)];
+const overlay = layerMesh(OVERLAY, 10);
+
+const quadCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+const quadScene = new THREE.Scene();
+const fbMat = new THREE.ShaderMaterial({
+  vertexShader: QUAD_VERT, fragmentShader: FEEDBACK, depthTest: false, depthWrite: false,
+  uniforms: { uCur: { value: null }, uPrev: { value: null }, uTrail: { value: 0.6 }, uFlow: { value: 1 }, uTime: shared.uTime },
+});
+const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), fbMat);
+quad.frustumCulled = false;
+quadScene.add(quad);
+
+const rtOpts = { type: THREE.HalfFloatType, depthBuffer: false, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter };
+const sceneRT = new THREE.WebGLRenderTarget(4, 4, rtOpts);
+let fbA = new THREE.WebGLRenderTarget(4, 4, rtOpts), fbB = new THREE.WebGLRenderTarget(4, 4, rtOpts);
+
+const composer = new EffectComposer(renderer);
+const texPass = new TexturePass(fbA.texture);
+const bloom = new UnrealBloomPass(new THREE.Vector2(256, 256), 0.6, 0.55, 0.85);
+{ const ss = bloom.setSize.bind(bloom); bloom.setSize = (w, h) => ss(Math.round(w * 0.6), Math.round(h * 0.6)); }
+const finalPass = new ShaderPass(FINAL);
+composer.addPass(texPass); composer.addPass(bloom); composer.addPass(finalPass); composer.addPass(new OutputPass());
+
+let renderScale = params.has('q') ? parseFloat(params.get('q')) : 0.7;
+const autoQuality = !params.has('q');
+function resize() {
+  const w = window.innerWidth, h = window.innerHeight;
+  renderer.setSize(w, h);
+  composer.setSize(w, h);
+  camera.aspect = w / h; camera.updateProjectionMatrix();
+  const sw = Math.max(64, Math.round(w * PR * renderScale)), sh = Math.max(64, Math.round(h * PR * renderScale));
+  sceneRT.setSize(sw, sh); fbA.setSize(sw, sh); fbB.setSize(sw, sh);
+  finalPass.uniforms.uRes.value.set(w * PR, h * PR);
+}
+window.addEventListener('resize', resize);
+resize();
+
+/* =====================================================================
+   STATE / INPUT
+   ===================================================================== */
+const sound = new Ceremony();
+const $ = (id) => document.getElementById(id);
+const intro = $('intro'), enterBtn = $('enter'), toastEl = $('toast'), keysEl = $('keys');
+let started = false, paused = false, ready = false;
+let cycleT = params.has('t') ? parseFloat(params.get('t')) : 2;
+let time = 0, lastPhase = -1, whooshArmed = true;
+let yaw = 0, pitch = 0, yawV = 0, pitchV = 0, dragging = false, lastX = 0, lastY = 0;
+
+function toast(msg) { toastEl.textContent = msg; toastEl.classList.add('show'); clearTimeout(toast.t); toast.t = setTimeout(() => toastEl.classList.remove('show'), 1600); }
+function jumpTo(i) { cycleT = STARTS[(i + PHASES.length) % PHASES.length] + 0.01; whooshArmed = true; }
+
+function begin(fullscreen) {
+  if (started) return;
+  started = true;
+  intro.classList.add('gone');
+  try { sound.start(); } catch (e) { console.warn('audio unavailable', e); }
+  if (fullscreen && document.documentElement.requestFullscreen && !params.has('nofs')) document.documentElement.requestFullscreen().catch(() => {});
+  if (!params.has('t')) cycleT = 0;
+  lastPhase = -1;
+  keysEl.classList.add('show'); setTimeout(() => keysEl.classList.remove('show'), 7000);
+}
+intro.addEventListener('click', () => { if (ready) begin(true); });
+if (params.has('view')) { started = true; intro.classList.add('gone'); }
+
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'KeyF') { document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen().catch(() => {}); }
+  else if (e.code === 'KeyM') { sound.setMuted(!sound.muted); toast(sound.muted ? 'muted' : 'sound on'); }
+  else if (e.code === 'Space') { paused = !paused; sound.pause(paused); toast(paused ? 'paused' : 'resumed'); e.preventDefault(); }
+  else if (e.code === 'ArrowRight') { jumpTo(phaseState(cycleT).i + 1); }
+  else if (e.code === 'ArrowLeft') { jumpTo(phaseState(cycleT).i - 1); }
+  else if (/^Digit[1-6]$/.test(e.code)) { jumpTo(parseInt(e.code.slice(5)) - 1); }
+  else if (e.code === 'Enter' && ready) { begin(true); }
+});
+
+// drag to look around (mouse or touch); inertia makes it feel like floating
+let idleTimer = 0;
+window.addEventListener('pointerdown', (e) => { if (!started) return; dragging = true; lastX = e.clientX; lastY = e.clientY; });
+window.addEventListener('pointerup', () => { dragging = false; });
+window.addEventListener('pointermove', (e) => {
+  if (dragging) {
+    const k = 0.0032 * (camera.fov / 70);
+    yawV = (e.clientX - lastX) * k; pitchV = (e.clientY - lastY) * k;
+    yaw += yawV; pitch = Math.max(-1.45, Math.min(1.45, pitch + pitchV));
+    lastX = e.clientX; lastY = e.clientY;
+  }
+  document.body.classList.remove('idle'); clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => document.body.classList.add('idle'), 2500);
+});
+
+/* =====================================================================
+   LOOP
+   ===================================================================== */
+const clock = new THREE.Clock();
+let fpsFrames = 0, fpsTime = 0;
+
+function step(dt) {
+  if (!paused) { time += dt; cycleT += dt; }
+  if (!started && !params.has('t')) cycleT = 2 + (time % 30);
+  const s = phaseState(cycleT);
+
+  if (started && s.i !== lastPhase) {
+    if (sound.ctx && lastPhase !== -1) sound.bowl(sound.ctx.currentTime + 0.05, [196, 174.6, 146.8, 220, 164.8, 196][s.i]);
+    if (s.i === 1) whooshArmed = true;
+    lastPhase = s.i;
+  }
+  if (started && sound.ctx && whooshArmed && s.i === 1 && s.sinceBreak > -8.5 && s.sinceBreak < -7) {
+    sound.whoosh(sound.ctx.currentTime, -s.sinceBreak); whooshArmed = false;
+  }
+  if (!paused) sound.update(s);
+
+  // travel
+  const sp = paused ? 0 : dt;
+  shared.uDrift.value += sp * (0.45 + 2.2 * s.onset + 4.0 * s.zoom);
+  const burst = s.sinceBreak > 0 ? 7 * Math.exp(-s.sinceBreak * 0.5) : 0;
+  shared.uTravel.value += sp * (s.w[1] > 0.001 ? 1.1 + 2.0 * s.intensity + burst : 0);
+  shared.uSTravel.value += sp * (s.w[3] > 0.001 ? 1.4 : 0);
+
+  // floating in zero-g: look inertia and a very slow drift of the view
+  if (!dragging) { yawV *= 0.94; pitchV *= 0.94; yaw += yawV * 0.5; pitch = Math.max(-1.45, Math.min(1.45, pitch + pitchV * 0.5)); }
+  const drift = Math.sin(time * 0.42);
+  camera.rotation.set(pitch + drift * 0.004 + Math.sin(time * 0.13) * 0.01, yaw + Math.sin(time * 0.07) * 0.015, Math.sin(time * 0.05) * 0.01);
+  camera.position.set(0, drift * 0.015, 0);
+  camera.fov = 70 + drift * 0.4 * s.intensity + s.zoom * 6;
+  camera.updateProjectionMatrix();
+
+  if (!paused) shared.uTime.value = time;
+  shared.uOnset.value = s.onset;
+  shared.uIntensity.value = s.intensity;
+  shared.uGalaxy.value = s.galaxy;
+  shared.uWarm.value = s.warm;
+  shared.uAudio.value = Math.min(sound.level * 4, 1);
+  for (let k = 0; k < 4; k++) { layers[k].material.uniforms.uWeight.value = s.w[k]; layers[k].visible = s.w[k] > 0.002; }
+  overlay.material.uniforms.uWeight.value = s.onset; overlay.visible = s.onset > 0.002;
+
+  shared.uQ.value = 1;
+  shared.uPixAng.value = 2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2) / sceneRT.height;
+
+  // 1. the world (all active layers, additive crossfade)
+  renderer.setRenderTarget(sceneRT);
+  renderer.setClearColor(0x000000, 1);
+  renderer.render(world, camera);
+  // 2. tracers
+  fbMat.uniforms.uCur.value = sceneRT.texture;
+  fbMat.uniforms.uPrev.value = fbA.texture;
+  fbMat.uniforms.uTrail.value = paused ? 0 : Math.min(0.35 + 0.4 * s.intensity, 0.75);
+  fbMat.uniforms.uFlow.value = 0.4 + 1.6 * s.intensity;
+  renderer.setRenderTarget(fbB); renderer.render(quadScene, quadCam);
+  [fbA, fbB] = [fbB, fbA];
+  renderer.setRenderTarget(null);
+  // 3. lens, bloom, body
+  texPass.map = fbA.texture;
+  bloom.strength = 0.5 + 0.3 * s.intensity + s.flash * 1.5;
+  finalPass.uniforms.uTime.value = time;
+  finalPass.uniforms.uIntensity.value = s.intensity;
+  finalPass.uniforms.uFlash.value = s.flash * 0.9;
+  finalPass.uniforms.uZoom.value = s.zoom;
+  composer.render(dt);
+  return s;
+}
+
+function frame() {
+  const dt = Math.min(clock.getDelta(), 0.1);
+  step(dt);
+  fpsFrames++; fpsTime += dt;
+  if (fpsTime > 2.0) {
+    const fps = fpsFrames / fpsTime; fpsFrames = 0; fpsTime = 0;
+    window.__fps = fps;
+    if (autoQuality) {
+      if (fps < 40 && renderScale > 0.4) { renderScale = Math.max(0.4, renderScale - 0.07); resize(); }
+      else if (fps > 57 && renderScale < 0.95) { renderScale = Math.min(0.95, renderScale + 0.04); resize(); }
+    }
+  }
+}
+
+// development helpers (benchmark + snapshot)
+window.__set = (o) => { if (o.t != null) cycleT = o.t; if (o.q) { renderScale = o.q; resize(); } if (o.yaw != null) { yaw = o.yaw; pitch = o.pitch || 0; } };
+window.__bench = (n = 10) => {
+  const gl = renderer.getContext(), px = new Uint8Array(4);
+  step(1 / 60); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+  const t0 = performance.now();
+  for (let k = 0; k < n; k++) { step(1 / 60); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); }
+  return (performance.now() - t0) / n;
+};
+window.__probe = (rt = 'scene') => {
+  const target = rt === 'scene' ? sceneRT : fbA, out = {}, buf = new Uint16Array(4);
+  for (const [k, fx, fy] of [['c', .5, .5], ['tl', .1, .9], ['br', .9, .1], ['m', .3, .6]]) {
+    renderer.readRenderTargetPixels(target, Math.floor(target.width * fx), Math.floor(target.height * fy), 1, 1, buf);
+    out[k] = Array.from(buf).slice(0, 3).map(v => +THREE.DataUtils.fromHalfFloat(v).toFixed(3));
+  }
+  return JSON.stringify(out);
+};
+window.__snap = async (t, frames = 10) => {
+  if (t != null) cycleT = t;
+  const gl = renderer.getContext(), px = new Uint8Array(4);
+  for (let k = 0; k < frames; k++) { step(1 / 30); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); await new Promise(r => setTimeout(r, 5)); }
+  let img = document.getElementById('__snap');
+  if (!img) { img = document.createElement('img'); img.id = '__snap'; img.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;z-index:99'; document.body.appendChild(img); }
+  img.src = renderer.domElement.toDataURL('image/jpeg', 0.9);
+  return phaseState(cycleT).i;
+};
+
+// compile every shader before allowing entry, so transitions never hitch
+function warmup() {
+  const tiny = new THREE.WebGLRenderTarget(8, 8, rtOpts);
+  const vis = [...layers, overlay].map(m => m.visible);
+  [...layers, overlay].forEach(m => { m.visible = true; m.material.uniforms.uWeight.value = 0.001; });
+  renderer.setRenderTarget(tiny);
+  renderer.render(world, camera);
+  renderer.render(quadScene, quadCam);
+  renderer.setRenderTarget(null);
+  [...layers, overlay].forEach((m, k) => { m.visible = vis[k]; });
+  tiny.dispose();
+}
+setTimeout(() => {
+  try { warmup(); } catch (e) { console.error(e); }
+  ready = true;
+  enterBtn.disabled = false; enterBtn.textContent = 'Begin';
+  enterBtn.addEventListener('click', (e) => { e.stopPropagation(); begin(true); });
+  clock.getDelta();
+  if (params.has('noloop')) return;
+  renderer.setAnimationLoop(frame);
+}, 60);
+</script>
+</body>
+</html>
